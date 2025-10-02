@@ -1,9 +1,15 @@
 // api/find.js
 import { MongoClient } from "mongodb";
+import { EJSON } from "bson";  // ⬅️ enables {"$date": "..."} parsing
+
 let client, ready;
 async function getClient() {
-  if (!ready) { client = new MongoClient(process.env.MONGODB_URI, { maxPoolSize: 5 }); ready = client.connect(); }
-  await ready; return client;
+  if (!ready) {
+    client = new MongoClient(process.env.MONGODB_URI, { maxPoolSize: 5 });
+    ready = client.connect();
+  }
+  await ready;
+  return client;
 }
 
 function coerceSort(sort) {
@@ -17,6 +23,11 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
   if (req.headers["x-api-key"] !== process.env.SHORTCUTS_API_KEY) return res.status(401).json({ error: "unauthorized" });
 
+  // IMPORTANT: Deserialize Extended JSON to real types (Date, ObjectId, etc.)
+  // Works whether req.body is a string or an already-parsed object.
+  const rawBody = req.body ?? {};
+  const body = typeof rawBody === "string" ? EJSON.parse(rawBody) : EJSON.deserialize(rawBody);
+
   const {
     database, collection,
     filter = {},
@@ -24,35 +35,15 @@ export default async function handler(req, res) {
     sort,
     limit,
     skip,
-    collation,
-    // NEW: if true and sort contains "timestamp", cast it to Date for sort
-    sortTimestampAsDate = false
-  } = req.body || {};
+    collation
+  } = body;
 
   if (!database || !collection) return res.status(400).json({ error: "database & collection required" });
 
   try {
     const coll = (await getClient()).db(database).collection(collection);
-
-    // If we need to cast "timestamp" to a date for sorting, use aggregation
-    const timestampSortDir = sort && sort.hasOwnProperty("timestamp") ? coerceSort(sort)["timestamp"] : undefined;
-    if (sortTimestampAsDate && timestampSortDir) {
-      const pipeline = [
-        { $match: filter },
-        // cast to a real Date in a temp field (handles ISO strings & unix numbers)
-        { $addFields: { _tsSort: { $toDate: "$timestamp" } } },
-        { $sort: { _tsSort: timestampSortDir } },
-      ];
-      if (typeof skip === "number") pipeline.push({ $skip: skip });
-      if (typeof limit === "number") pipeline.push({ $limit: limit });
-      if (projection) pipeline.push({ $project: projection });
-
-      const docs = await coll.aggregate(pipeline, { collation }).toArray();
-      return res.json({ documents: docs });
-    }
-
-    // Normal find/sort path
     const cursor = coll.find(filter, { projection });
+
     const sortSpec = coerceSort(sort);
     if (sortSpec) cursor.sort(sortSpec);
     if (typeof skip === "number") cursor.skip(skip);
