@@ -1,72 +1,88 @@
-const crypto = require("crypto");
-const { MongoClient } = require("mongodb");
+// api/bot-status.js
+import { MongoClient } from "mongodb";
+import { EJSON } from "bson";
 
-let cachedClient = null;
-
-function safeEqual(a, b) {
-  const aBuf = Buffer.from(a || "");
-  const bBuf = Buffer.from(b || "");
-  if (aBuf.length !== bBuf.length) return false;
-  return crypto.timingSafeEqual(aBuf, bBuf);
-}
+let client, ready;
 
 async function getClient() {
-  if (cachedClient) return cachedClient;
-
-  const uri = process.env.MONGODB_URI;
-  if (!uri) throw new Error("Missing MONGODB_URI env var");
-
-  cachedClient = new MongoClient(uri, {
-    // optional: helps in some corporate/proxy environments
-    serverSelectionTimeoutMS: 5000,
-  });
-
-  await cachedClient.connect();
-  return cachedClient;
+  if (!ready) {
+    client = new MongoClient(process.env.MONGODB_URI, { maxPoolSize: 5 });
+    ready = client.connect();
+  }
+  await ready;
+  return client;
 }
 
-module.exports = async (req, res) => {
-  try {
-    if (req.method !== "POST") {
-      res.setHeader("Allow", "POST");
-      return res.status(405).json({ ok: false, error: "method not allowed" });
-    }
-
-    // --- Auth (simple bearer token) ---
-    const auth = req.headers.authorization || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    const expected = process.env.BOT_STATUS_TOKEN || "";
-
-    if (!expected || !token || !safeEqual(token, expected)) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
-    // --- Parse body ---
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-
-    const { botName, runId, status, message, ts } = body || {};
-    if (!botName || !status) {
-      return res.status(400).json({ ok: false, error: "invalid payload" });
-    }
-
-    // --- Write to MongoDB ---
-    const client = await getClient();
-    const dbName = process.env.MONGODB_DB || "bot_status";
-    const colName = process.env.MONGODB_COLLECTION || "runs";
-
-    const newRunId = runId || crypto.randomUUID();
-
-    await client.db(dbName).collection(colName).insertOne({
-      botName,
-      runId: newRunId,
-      status,              // "started" | "success" | "failed" (or whatever you want)
-      message: message ?? null,
-      ts: ts ? new Date(ts) : new Date(),
-      receivedAt: new Date(),
-    });
-
-    return res.status(200).json({ ok: true, runId: newRunId });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message || "server error" });
+/**
+ * POST /api/bot-status
+ * Auth: x-api-key must match SHORTCUTS_API_KEY
+ *
+ * Body (supports Extended JSON):
+ * {
+ *   "database": "your_db",
+ *   "collection": "your_collection",
+ *   "timestamp": "2026-02-01", // or Extended JSON date
+ *   "job_status": "bot running",
+ *   "to_create": 0,
+ *   "created": 0
+ * }
+ *
+ * Behavior:
+ * - Upsert a single "daily" doc keyed by { timestamp }
+ * - $set: job_status, to_create, created, timestamp
+ * - Also sets updated_at each call; sets created_at on insert only
+ */
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.headers["x-api-key"] !== process.env.SHORTCUTS_API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
   }
-};
+
+  // Accept Extended JSON anywhere in the body
+  const rawBody = req.body ?? {};
+  const body = typeof rawBody === "string" ? EJSON.parse(rawBody) : EJSON.deserialize(rawBody);
+
+  const {
+    database,
+    collection,
+    timestamp,
+    job_status = "bot running",
+    to_create = 0,
+    created = 0,
+  } = body || {};
+
+  if (!database || !collection) return res.status(400).json({ error: "database & collection required" });
+  if (timestamp === undefined || timestamp === null) {
+    return res.status(400).json({ error: "timestamp required" });
+  }
+
+  try {
+    const coll = (await getClient()).db(database).collection(collection);
+
+    const filter = { timestamp };
+
+    const update = {
+      $set: {
+        job_status,
+        timestamp,
+        to_create,
+        created,
+        updated_at: new Date(),
+      },
+      $setOnInsert: {
+        created_at: new Date(),
+      },
+    };
+
+    const result = await coll.updateOne(filter, update, { upsert: true });
+
+    return res.json({
+      ok: true,
+      matchedCount: result.matchedCount ?? 0,
+      modifiedCount: result.modifiedCount ?? 0,
+      upsertedId: result.upsertedId ?? null,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
